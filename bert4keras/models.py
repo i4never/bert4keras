@@ -1083,10 +1083,111 @@ class NEZHA(BERT):
                 inputs=[x, x],
                 layer=RelativePositionEmbedding,
                 input_dim=2 * 64 + 1,
-                output_dim=self.attention_head_size,
+                output_dim=self.attention_key_size,
                 embeddings_initializer='Sinusoidal',
                 name='Embedding-Relative-Position',
                 trainable=False
+            )
+
+        return self.position_bias
+
+
+class RoFormer(NEZHA):
+    """旋转式位置编码的BERT模型
+    链接：https://kexue.fm/archives/8265
+    """
+    def apply_main_layers(self, inputs, index):
+        """RoFormer的主体是基于Self-Attention的模块
+        顺序：Att --> Add --> LN --> FFN --> Add --> LN
+        """
+        x = inputs
+        z = self.layer_norm_conds[0]
+
+        attention_name = 'Transformer-%d-MultiHeadSelfAttention' % index
+        feed_forward_name = 'Transformer-%d-FeedForward' % index
+        attention_mask = self.compute_attention_bias(index)
+        position_bias = self.compute_position_bias(x)
+
+        # Self Attention
+        xi, x = x, [x, x, x, position_bias]
+        arguments = {'a_bias': None, 'p_bias': 'rotary'}
+        if attention_mask is not None:
+            arguments['a_bias'] = True
+            x.insert(3, attention_mask)
+
+        x = self.apply(
+            inputs=x,
+            layer=MultiHeadAttention,
+            arguments=arguments,
+            heads=self.num_attention_heads,
+            head_size=self.attention_head_size,
+            out_dim=self.hidden_size,
+            key_size=self.attention_key_size,
+            kernel_initializer=self.initializer,
+            name=attention_name
+        )
+        x = self.apply(
+            inputs=x,
+            layer=Dropout,
+            rate=self.dropout_rate,
+            name='%s-Dropout' % attention_name
+        )
+        x = self.apply(
+            inputs=[xi, x], layer=Add, name='%s-Add' % attention_name
+        )
+        x = self.apply(
+            inputs=self.simplify([x, z]),
+            layer=LayerNormalization,
+            conditional=(z is not None),
+            hidden_units=self.layer_norm_conds[1],
+            hidden_activation=self.layer_norm_conds[2],
+            hidden_initializer=self.initializer,
+            name='%s-Norm' % attention_name
+        )
+
+        # Feed Forward
+        xi = x
+        x = self.apply(
+            inputs=x,
+            layer=FeedForward,
+            units=self.intermediate_size,
+            activation=self.hidden_act,
+            kernel_initializer=self.initializer,
+            name=feed_forward_name
+        )
+        x = self.apply(
+            inputs=x,
+            layer=Dropout,
+            rate=self.dropout_rate,
+            name='%s-Dropout' % feed_forward_name
+        )
+        x = self.apply(
+            inputs=[xi, x], layer=Add, name='%s-Add' % feed_forward_name
+        )
+        x = self.apply(
+            inputs=self.simplify([x, z]),
+            layer=LayerNormalization,
+            conditional=(z is not None),
+            hidden_units=self.layer_norm_conds[1],
+            hidden_activation=self.layer_norm_conds[2],
+            hidden_initializer=self.initializer,
+            name='%s-Norm' % feed_forward_name
+        )
+
+        return x
+
+    def compute_position_bias(self, inputs=None):
+        """Sinusoidal位置编码（直接返回）
+        """
+        if self.position_bias is None:
+
+            x = inputs
+            self.position_bias = self.apply(
+                inputs=x,
+                layer=SinusoidalPositionEmbedding,
+                output_dim=self.attention_key_size,
+                merge_mode='zero',
+                name='Embedding-Rotary-Position'
             )
 
         return self.position_bias
@@ -1957,6 +2058,9 @@ class T5_Decoder(LM_Mask, T5_Base):
         """
         c, x = inputs
 
+        c = self.apply(
+            inputs=c, layer=Masking, mask_value=0.0, name='Masked-Context'
+        )
         x = self.apply(
             inputs=x,
             layer=Embedding,
@@ -1980,13 +2084,6 @@ class T5_Decoder(LM_Mask, T5_Base):
                 kernel_initializer=self.initializer,
                 name='Decoder-Embedding-Mapping'
             )
-
-        c = self.apply(
-            inputs=c,
-            layer=Masking,
-            mask_value=0.,
-            name='Masked-Context'
-        )
 
         return [c, x]
 
@@ -2303,6 +2400,7 @@ def build_transformer_model(
         'albert_unshared': ALBERT_Unshared,
         'roberta': BERT,
         'nezha': NEZHA,
+        'roformer': RoFormer,
         'electra': ELECTRA,
         'gpt': GPT,
         'gpt2': GPT2,
