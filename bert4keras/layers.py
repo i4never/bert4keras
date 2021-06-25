@@ -494,8 +494,7 @@ class LayerNormalization(Layer):
         if self.scale:
             variance = K.mean(K.square(outputs), axis=-1, keepdims=True)
             std = K.sqrt(variance + self.epsilon)
-            outputs = outputs / std
-            outputs = outputs * gamma
+            outputs = outputs / std * gamma
         if self.center:
             outputs = outputs + beta
 
@@ -1156,6 +1155,65 @@ class MaximumEntropyMarkovModel(Layer):
         return dict(list(base_config.items()) + list(config.items()))
 
 
+class GlobalPointer(Layer):
+    """全局指针模块
+    将序列的每个(start, end)作为整体来进行判断
+    """
+    def __init__(self, heads, head_size, RoPE=True, **kwargs):
+        super(GlobalPointer, self).__init__(**kwargs)
+        self.heads = heads
+        self.head_size = head_size
+        self.RoPE = RoPE
+
+    def build(self, input_shape):
+        super(GlobalPointer, self).build(input_shape)
+        self.dense = Dense(self.head_size * self.heads * 2)
+
+    def compute_mask(self, inputs, mask=None):
+        return None
+
+    @recompute_grad
+    def call(self, inputs, mask=None):
+        # 输入变换
+        inputs = self.dense(inputs)
+        inputs = tf.split(inputs, self.heads, axis=-1)
+        inputs = K.stack(inputs, axis=-2)
+        qw, kw = inputs[..., :self.head_size], inputs[..., self.head_size:]
+        # RoPE编码
+        if self.RoPE:
+            pos = SinusoidalPositionEmbedding(self.head_size, 'zero')(inputs)
+            cos_pos = K.repeat_elements(pos[..., None, 1::2], 2, -1)
+            sin_pos = K.repeat_elements(pos[..., None, ::2], 2, -1)
+            qw2 = K.stack([-qw[..., 1::2], qw[..., ::2]], 4)
+            qw2 = K.reshape(qw2, K.shape(qw))
+            qw = qw * cos_pos + qw2 * sin_pos
+            kw2 = K.stack([-kw[..., 1::2], kw[..., ::2]], 4)
+            kw2 = K.reshape(kw2, K.shape(kw))
+            kw = kw * cos_pos + kw2 * sin_pos
+        # 计算内积
+        logits = tf.einsum('bmhd,bnhd->bhmn', qw, kw)
+        # 排除padding
+        logits = sequence_masking(logits, mask, '-inf', 2)
+        logits = sequence_masking(logits, mask, '-inf', 3)
+        # 排除下三角
+        mask = tf.linalg.band_part(K.ones_like(logits), 0, -1)
+        logits = logits - (1 - mask) * 1e12
+        # scale返回
+        return logits / self.head_size**0.5
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], self.heads, input_shape[1], input_shape[1])
+
+    def get_config(self):
+        config = {
+            'heads': self.heads,
+            'head_size': self.head_size,
+            'RoPE': self.RoPE,
+        }
+        base_config = super(GlobalPointer, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
 class Loss(Layer):
     """特殊的层，用来定义复杂loss
     """
@@ -1214,6 +1272,7 @@ custom_objects = {
     'FeedForward': FeedForward,
     'ConditionalRandomField': ConditionalRandomField,
     'MaximumEntropyMarkovModel': MaximumEntropyMarkovModel,
+    'GlobalPointer': GlobalPointer,
     'Loss': Loss,
 }
 

@@ -5,7 +5,8 @@ import numpy as np
 from bert4keras.layers import *
 from bert4keras.snippets import insert_arguments
 from bert4keras.snippets import delete_arguments
-from bert4keras.snippets import is_string, is_one_of
+from bert4keras.snippets import is_string
+from bert4keras.snippets import orthogonally_resize
 from keras.models import Model
 import json
 
@@ -30,6 +31,7 @@ class Transformer(object):
         compound_tokens=None,  # 扩展Embedding
         residual_attention_scores=False,  # Attention矩阵加残差
         ignore_invalid_weights=False,  # 允许跳过不存在的权重
+        autoresize_weights=False,  # 自动变换形状不匹配的权重
         layers=None,  # 外部传入的Keras层
         prefix=None,  # 层名前缀
         name=None,  # 模型名称
@@ -57,6 +59,7 @@ class Transformer(object):
         self.attention_scores = None
         self.residual_attention_scores = residual_attention_scores
         self.ignore_invalid_weights = ignore_invalid_weights
+        self.autoresize_weights = autoresize_weights
         self.layers = {} if layers is None else layers
         self.prefix = prefix or ''
         self.name = name
@@ -154,9 +157,10 @@ class Transformer(object):
                         if arguments.get('a_bias'):
                             a_bias = Add(name=name + '-Attention-Bias'
                                         )([inputs[3], self.attention_scores])
+                            inputs = inputs[:3] + [a_bias] + inputs[4:]
                         else:
                             a_bias = self.attention_scores
-                        inputs = inputs[:3] + [a_bias] + inputs[4:]
+                            inputs = inputs[:3] + [a_bias] + inputs[3:]
                         arguments['a_bias'] = True
                     o, a = self.layers[name](inputs, **arguments)
                     self.attention_scores = a
@@ -296,30 +300,30 @@ class Transformer(object):
                     else:
                         raise e
 
-            if isinstance(layer, MultiHeadAttention):
-                """如果key_size不等于head_size，则可以通过
-                正交矩阵将相应的权重投影到合适的shape。
-                """
-                count = 2
-                if layer.use_bias:
-                    count += 2
-                heads = self.num_attention_heads
-                head_size = self.attention_head_size
-                key_size = self.attention_key_size
-                W = np.linalg.qr(np.random.randn(key_size, head_size))[0].T
-                if layer.attention_scale:
-                    W = W * key_size**0.25 / head_size**0.25
-                for w, v in zip(weights, values):
-                    if is_one_of(w, layer.trainable_weights[:count]):
-                        w_shape, v_shape = K.int_shape(w), v.shape
-                        if w_shape[-1] != v_shape[-1]:
-                            pre_shape = w_shape[:-1]
-                            v = v.reshape(pre_shape + (heads, head_size))
-                            v = np.dot(v, W)
-                            v = v.reshape(pre_shape + (heads * key_size,))
-                            values[weights.index(w)] = v
+            for i, (w, v) in enumerate(zip(weights, values)):
+                if v is not None:
+                    w_shape, v_shape = K.int_shape(w), v.shape
+                    if self.autoresize_weights and w_shape != v_shape:
+                        v = orthogonally_resize(v, w_shape)
+                        if isinstance(layer, MultiHeadAttention):
+                            count = 2
+                            if layer.use_bias:
+                                count += 2
+                            if layer.attention_scale and i < count:
+                                scale = 1.0 * w_shape[-1] / v_shape[-1]
+                                v = v * scale**0.25
+                        if isinstance(layer, FeedForward):
+                            count = 1
+                            if layer.use_bias:
+                                count += 1
+                            if self.hidden_act in ['relu', 'leaky_relu']:
+                                count -= 2
+                            if i < count:
+                                v *= np.sqrt(1.0 * w_shape[-1] / v_shape[-1])
+                            else:
+                                v *= np.sqrt(1.0 * v_shape[0] / w_shape[0])
 
-            weight_value_pairs.extend(zip(weights, values))
+                    weight_value_pairs.append((w, v))
 
         K.batch_set_value(weight_value_pairs)
 
@@ -2238,7 +2242,7 @@ class T5_Decoder(LM_Mask, T5_Base):
         x = self.apply(
             inputs=x,
             layer=Lambda,
-            function=lambda x: x / np.sqrt(self.hidden_size),
+            function=lambda x: x / self.hidden_size**0.5,
             mask=lambda i, m: m,
             name='Decoder-Output-Scale'
         )
